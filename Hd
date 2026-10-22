@@ -1,0 +1,80 @@
+Run it in four parts. Part 1 builds a base table, Part 2 runs the checks, and Part 3 is the final fetch. Change the client, company code and dates in Part 1 only.
+
+**Part 1: base table (Teradata)**
+```sql
+create volatile table vb as (
+  select k.bukrs, k.vbeln as bdoc, p.posnr as bitm, k.fkart, k.fkdat,
+         k.waerk, k.rfbsk, k.kunag, p.vgtyp, p.vgbel as dlv, p.vgpos as ditm,
+         p.matnr, p.fkimg, p.netwr, p.mwsbp
+  from sap.vbrk k
+  join sap.vbrp p on p.mandt = k.mandt and p.vbeln = k.vbeln
+  where k.mandt = '100'                              -- client
+    and k.bukrs = '1000'                             -- company code
+    and k.fkdat between date '2026-01-01' and date '2026-09-30'
+    and k.fksto <> 'X'                               -- not cancelled
+) with data on commit preserve rows;
+```
+
+**Part 2: checks (run all, read results before Part 3)**
+```sql
+-- 1. rows loaded vs raw VBRP, should match
+select (select count(*) from vb) as base_rows,
+       (select count(*) from sap.vbrp p join sap.vbrk k
+          on k.mandt = p.mandt and k.vbeln = p.vbeln
+        where k.mandt = '100' and k.bukrs = '1000'
+          and k.fkdat between date '2026-01-01' and date '2026-09-30'
+          and k.fksto <> 'X') as raw_rows;
+
+-- 2. duplicate keys, must return 0 rows
+select bdoc, bitm, count(*) from vb group by 1, 2 having count(*) > 1;
+
+-- 3. source doc split, expect mostly J (delivery)
+select vgtyp, count(*), sum(netwr) from vb group by 1;
+
+-- 4. delivery-based items with no LIPS match, should be 0
+select count(*) from vb v
+left join sap.lips i on i.mandt = '100' and i.vbeln = v.dlv and i.posnr = v.ditm
+where v.vgtyp = 'J' and i.vbeln is null;
+
+-- 5. billing docs with no FI document
+select count(distinct v.bdoc) from vb v
+left join sap.bkpf f on f.mandt = '100' and f.bukrs = v.bukrs
+                    and f.awtyp = 'VBRK' and trim(f.awkey) = trim(v.bdoc)
+where f.belnr is null;
+
+-- 6. not yet posted to accounting
+select rfbsk, count(distinct bdoc) from vb group by 1;
+
+-- 7. net value by currency, for your reconciliation
+select waerk, sum(netwr) from vb group by 1;
+```
+
+**Part 3: final fetch**
+```sql
+select v.bukrs, v.bdoc, v.bitm, v.fkart, v.fkdat, v.waerk, v.rfbsk,
+       v.vgtyp, v.matnr, v.fkimg, v.netwr, v.mwsbp,
+       h.vbeln as dlv, i.posnr as ditm, h.lfart, h.erdat as dlv_date,
+       h.wadat_ist as gi_date, i.lfimg as dlv_qty,
+       h.kunnr as ship_to, c.name1 as cust_name,
+       f.belnr as fi_doc, f.gjahr, f.budat as post_date
+from vb v
+left join sap.lips i on i.mandt = '100' and i.vbeln = v.dlv and i.posnr = v.ditm
+                    and v.vgtyp = 'J'
+left join sap.likp h on h.mandt = i.mandt and h.vbeln = i.vbeln
+left join sap.kna1 c on c.mandt = '100' and c.kunnr = v.kunag
+left join sap.bkpf f on f.mandt = '100' and f.bukrs = v.bukrs
+                    and f.awtyp = 'VBRK' and trim(f.awkey) = trim(v.bdoc);
+
+-- final check: count(*) here should equal Part 2, check 1
+```
+
+**Part 4: drop when done**
+```sql
+drop table vb;
+```
+
+Notes:
+- If the final count is higher than base_rows, a join is duplicating. The usual cause is more than one BKPF row per billing doc (reversals), so add `and f.stblg is null`.
+- Cancellation docs (usually FKART S1) are not excluded. Add `and k.fkart <> 'S1'` if your system uses that type.
+- This is for billed deliveries only. If you need unbilled ones, I can write the sales org version.
+- I assumed client 100 and company code 1000. Replace both with yours.
